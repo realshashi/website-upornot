@@ -1,0 +1,473 @@
+// server/index.ts
+import express2 from "express";
+
+// server/routes.ts
+import { createServer } from "http";
+
+// server/storage.ts
+var MemStorage = class {
+  users;
+  logs;
+  config;
+  userId;
+  logId;
+  configId;
+  constructor() {
+    this.users = /* @__PURE__ */ new Map();
+    this.logs = /* @__PURE__ */ new Map();
+    this.userId = 1;
+    this.logId = 1;
+    this.configId = 1;
+    this.config = {
+      id: this.configId,
+      targetUrl: process.env.TARGET_URL || "https://example.com",
+      checkIntervalMs: 3e5,
+      // 5 minutes in milliseconds
+      isActive: true,
+      lastUpdated: /* @__PURE__ */ new Date()
+    };
+  }
+  async getUser(id) {
+    return this.users.get(id);
+  }
+  async getUserByUsername(username) {
+    return Array.from(this.users.values()).find(
+      (user) => user.username === username
+    );
+  }
+  async createUser(insertUser) {
+    const id = this.userId++;
+    const user = { ...insertUser, id };
+    this.users.set(id, user);
+    return user;
+  }
+  // MonitoringLog methods
+  async getLogs(limit) {
+    const logs = Array.from(this.logs.values()).sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime());
+    if (limit && limit > 0) {
+      return logs.slice(0, limit);
+    }
+    return logs;
+  }
+  async createLog(insertLog) {
+    const id = this.logId++;
+    const log2 = {
+      ...insertLog,
+      id,
+      timestamp: /* @__PURE__ */ new Date()
+    };
+    this.logs.set(id, log2);
+    return log2;
+  }
+  async clearLogs() {
+    this.logs.clear();
+  }
+  async getLogStats() {
+    const logs = Array.from(this.logs.values());
+    const totalRequests = logs.length;
+    const successCount = logs.filter((log2) => log2.success).length;
+    return {
+      totalRequests,
+      successCount
+    };
+  }
+  // MonitoringConfig methods
+  async getConfig() {
+    return this.config;
+  }
+  async createOrUpdateConfig(configData) {
+    if (!this.config) {
+      this.config = {
+        id: this.configId,
+        targetUrl: configData.targetUrl || process.env.TARGET_URL || "https://example.com",
+        checkIntervalMs: configData.checkIntervalMs || 3e5,
+        isActive: configData.isActive !== void 0 ? configData.isActive : true,
+        lastUpdated: /* @__PURE__ */ new Date()
+      };
+    } else {
+      if (configData.targetUrl !== void 0) {
+        this.config.targetUrl = configData.targetUrl;
+      }
+      if (configData.checkIntervalMs !== void 0) {
+        this.config.checkIntervalMs = configData.checkIntervalMs;
+      }
+      if (configData.isActive !== void 0) {
+        this.config.isActive = configData.isActive;
+      }
+      this.config.lastUpdated = /* @__PURE__ */ new Date();
+    }
+    return this.config;
+  }
+  async toggleMonitorActive(isActive) {
+    if (!this.config) {
+      return this.createOrUpdateConfig({ isActive });
+    }
+    this.config.isActive = isActive;
+    this.config.lastUpdated = /* @__PURE__ */ new Date();
+    return this.config;
+  }
+};
+var storage = new MemStorage();
+
+// server/routes.ts
+import { z } from "zod";
+
+// server/monitor.ts
+import axios from "axios";
+import { scheduleJob } from "node-schedule";
+var WebsiteMonitor = class {
+  job = null;
+  isRunning = false;
+  targetUrl = "";
+  checkIntervalMs = 3e5;
+  // Default 5 minutes
+  constructor() {
+    this.initialize();
+  }
+  async initialize() {
+    const config = await storage.getConfig();
+    if (config) {
+      this.targetUrl = config.targetUrl;
+      this.checkIntervalMs = config.checkIntervalMs;
+      if (config.isActive) {
+        this.start();
+      }
+    }
+  }
+  async checkWebsite() {
+    const startTime = Date.now();
+    try {
+      const response = await axios.get(this.targetUrl, {
+        timeout: 3e4,
+        // 30 second timeout
+        validateStatus: () => true
+        // Capture all status codes, not just 2xx
+      });
+      const responseTime = Date.now() - startTime;
+      const success = response.status >= 200 && response.status < 400;
+      const logEntry = {
+        url: this.targetUrl,
+        statusCode: response.status,
+        success,
+        message: success ? `Request completed successfully in ${responseTime}ms` : `Request failed with status ${response.status}`,
+        responseTime
+      };
+      await storage.createLog(logEntry);
+      return logEntry;
+    } catch (error) {
+      const responseTime = Date.now() - startTime;
+      const errorMessage = error instanceof Error ? error.message : "Unknown error occurred";
+      const logEntry = {
+        url: this.targetUrl,
+        statusCode: 0,
+        success: false,
+        message: `Request failed: ${errorMessage}`,
+        responseTime
+      };
+      await storage.createLog(logEntry);
+      return logEntry;
+    }
+  }
+  async start() {
+    if (this.isRunning) return;
+    await this.checkWebsite();
+    const intervalMinutes = Math.floor(this.checkIntervalMs / 6e4);
+    this.job = scheduleJob(`*/${intervalMinutes} * * * *`, async () => {
+      await this.checkWebsite();
+    });
+    this.isRunning = true;
+    console.log(`Website monitor started. Checking ${this.targetUrl} every ${intervalMinutes} minutes.`);
+  }
+  stop() {
+    if (this.job) {
+      this.job.cancel();
+      this.job = null;
+    }
+    this.isRunning = false;
+    console.log("Website monitor stopped.");
+  }
+  async updateConfig(targetUrl, checkIntervalMs, isActive) {
+    const updateData = {};
+    if (targetUrl !== void 0) {
+      this.targetUrl = targetUrl;
+      updateData.targetUrl = targetUrl;
+    }
+    if (checkIntervalMs !== void 0) {
+      this.checkIntervalMs = checkIntervalMs;
+      updateData.checkIntervalMs = checkIntervalMs;
+    }
+    if (isActive !== void 0) {
+      if (isActive && !this.isRunning) {
+        this.start();
+      } else if (!isActive && this.isRunning) {
+        this.stop();
+      }
+      updateData.isActive = isActive;
+    }
+    if (Object.keys(updateData).length > 0) {
+      await storage.createOrUpdateConfig(updateData);
+    }
+    if (checkIntervalMs !== void 0 && this.isRunning) {
+      this.stop();
+      this.start();
+    }
+  }
+  getStatus() {
+    return {
+      isRunning: this.isRunning,
+      targetUrl: this.targetUrl,
+      checkIntervalMs: this.checkIntervalMs
+    };
+  }
+};
+var websiteMonitor = new WebsiteMonitor();
+
+// server/routes.ts
+async function registerRoutes(app2) {
+  app2.get("/api/config", async (req, res) => {
+    try {
+      const config = await storage.getConfig();
+      if (!config) {
+        return res.status(404).json({ message: "Configuration not found" });
+      }
+      res.json(config);
+    } catch (error) {
+      console.error("Error retrieving configuration:", error);
+      res.status(500).json({ message: "Failed to retrieve configuration" });
+    }
+  });
+  app2.post("/api/config", async (req, res) => {
+    try {
+      const configSchema = z.object({
+        targetUrl: z.string().url().optional(),
+        checkIntervalMs: z.number().min(6e4).optional(),
+        // Minimum 1 minute
+        isActive: z.boolean().optional()
+      });
+      const validatedData = configSchema.parse(req.body);
+      await websiteMonitor.updateConfig(
+        validatedData.targetUrl,
+        validatedData.checkIntervalMs,
+        validatedData.isActive
+      );
+      const updatedConfig = await storage.getConfig();
+      res.json(updatedConfig);
+    } catch (error) {
+      if (error instanceof z.ZodError) {
+        return res.status(400).json({ message: "Invalid configuration data", errors: error.errors });
+      }
+      console.error("Error updating configuration:", error);
+      res.status(500).json({ message: "Failed to update configuration" });
+    }
+  });
+  app2.post("/api/monitor/toggle", async (req, res) => {
+    try {
+      const schema = z.object({
+        isActive: z.boolean()
+      });
+      const { isActive } = schema.parse(req.body);
+      await websiteMonitor.updateConfig(void 0, void 0, isActive);
+      const config = await storage.getConfig();
+      res.json(config);
+    } catch (error) {
+      if (error instanceof z.ZodError) {
+        return res.status(400).json({ message: "Invalid request data", errors: error.errors });
+      }
+      console.error("Error toggling monitor:", error);
+      res.status(500).json({ message: "Failed to toggle monitor state" });
+    }
+  });
+  app2.post("/api/monitor/check", async (req, res) => {
+    try {
+      const result = await websiteMonitor.checkWebsite();
+      res.json(result);
+    } catch (error) {
+      console.error("Error checking website:", error);
+      res.status(500).json({ message: "Failed to check website" });
+    }
+  });
+  app2.get("/api/logs", async (req, res) => {
+    try {
+      const limitParam = req.query.limit;
+      const limit = limitParam ? parseInt(limitParam, 10) : void 0;
+      const logs = await storage.getLogs(limit);
+      res.json(logs);
+    } catch (error) {
+      console.error("Error retrieving logs:", error);
+      res.status(500).json({ message: "Failed to retrieve logs" });
+    }
+  });
+  app2.delete("/api/logs", async (req, res) => {
+    try {
+      await storage.clearLogs();
+      res.json({ message: "Logs cleared successfully" });
+    } catch (error) {
+      console.error("Error clearing logs:", error);
+      res.status(500).json({ message: "Failed to clear logs" });
+    }
+  });
+  app2.get("/api/logs/stats", async (req, res) => {
+    try {
+      const stats = await storage.getLogStats();
+      res.json(stats);
+    } catch (error) {
+      console.error("Error retrieving log statistics:", error);
+      res.status(500).json({ message: "Failed to retrieve log statistics" });
+    }
+  });
+  const httpServer = createServer(app2);
+  return httpServer;
+}
+
+// server/vite.ts
+import express from "express";
+import fs from "fs";
+import path2 from "path";
+import { createServer as createViteServer, createLogger } from "vite";
+
+// vite.config.ts
+import { defineConfig } from "vite";
+import react from "@vitejs/plugin-react";
+import path from "path";
+import runtimeErrorOverlay from "@replit/vite-plugin-runtime-error-modal";
+var vite_config_default = defineConfig({
+  plugins: [
+    react(),
+    runtimeErrorOverlay(),
+    ...process.env.NODE_ENV !== "production" && process.env.REPL_ID !== void 0 ? [
+      await import("@replit/vite-plugin-cartographer").then(
+        (m) => m.cartographer()
+      )
+    ] : []
+  ],
+  resolve: {
+    alias: {
+      "@": path.resolve(import.meta.dirname, "client", "src"),
+      "@shared": path.resolve(import.meta.dirname, "shared"),
+      "@assets": path.resolve(import.meta.dirname, "attached_assets")
+    }
+  },
+  root: path.resolve(import.meta.dirname, "client"),
+  build: {
+    outDir: path.resolve(import.meta.dirname, "dist/public"),
+    emptyOutDir: true
+  }
+});
+
+// server/vite.ts
+import { nanoid } from "nanoid";
+var viteLogger = createLogger();
+function log(message, source = "express") {
+  const formattedTime = (/* @__PURE__ */ new Date()).toLocaleTimeString("en-US", {
+    hour: "numeric",
+    minute: "2-digit",
+    second: "2-digit",
+    hour12: true
+  });
+  console.log(`${formattedTime} [${source}] ${message}`);
+}
+async function setupVite(app2, server) {
+  const serverOptions = {
+    middlewareMode: true,
+    hmr: { server },
+    allowedHosts: true
+  };
+  const vite = await createViteServer({
+    ...vite_config_default,
+    configFile: false,
+    customLogger: {
+      ...viteLogger,
+      error: (msg, options) => {
+        viteLogger.error(msg, options);
+        process.exit(1);
+      }
+    },
+    server: serverOptions,
+    appType: "custom"
+  });
+  app2.use(vite.middlewares);
+  app2.use("*", async (req, res, next) => {
+    const url = req.originalUrl;
+    try {
+      const clientTemplate = path2.resolve(
+        import.meta.dirname,
+        "..",
+        "client",
+        "index.html"
+      );
+      let template = await fs.promises.readFile(clientTemplate, "utf-8");
+      template = template.replace(
+        `src="/src/main.tsx"`,
+        `src="/src/main.tsx?v=${nanoid()}"`
+      );
+      const page = await vite.transformIndexHtml(url, template);
+      res.status(200).set({ "Content-Type": "text/html" }).end(page);
+    } catch (e) {
+      vite.ssrFixStacktrace(e);
+      next(e);
+    }
+  });
+}
+function serveStatic(app2) {
+  const distPath = path2.resolve(import.meta.dirname, "public");
+  if (!fs.existsSync(distPath)) {
+    throw new Error(
+      `Could not find the build directory: ${distPath}, make sure to build the client first`
+    );
+  }
+  app2.use(express.static(distPath));
+  app2.use("*", (_req, res) => {
+    res.sendFile(path2.resolve(distPath, "index.html"));
+  });
+}
+
+// server/index.ts
+var app = express2();
+app.use(express2.json());
+app.use(express2.urlencoded({ extended: false }));
+app.use((req, res, next) => {
+  const start = Date.now();
+  const path3 = req.path;
+  let capturedJsonResponse = void 0;
+  const originalResJson = res.json;
+  res.json = function(bodyJson, ...args) {
+    capturedJsonResponse = bodyJson;
+    return originalResJson.apply(res, [bodyJson, ...args]);
+  };
+  res.on("finish", () => {
+    const duration = Date.now() - start;
+    if (path3.startsWith("/api")) {
+      let logLine = `${req.method} ${path3} ${res.statusCode} in ${duration}ms`;
+      if (capturedJsonResponse) {
+        logLine += ` :: ${JSON.stringify(capturedJsonResponse)}`;
+      }
+      if (logLine.length > 80) {
+        logLine = logLine.slice(0, 79) + "\u2026";
+      }
+      log(logLine);
+    }
+  });
+  next();
+});
+(async () => {
+  const server = await registerRoutes(app);
+  app.use((err, _req, res, _next) => {
+    const status = err.status || err.statusCode || 500;
+    const message = err.message || "Internal Server Error";
+    res.status(status).json({ message });
+    throw err;
+  });
+  if (app.get("env") === "development") {
+    await setupVite(app, server);
+  } else {
+    serveStatic(app);
+  }
+  const port = 5e3;
+  server.listen({
+    port,
+    host: "0.0.0.0",
+    reusePort: true
+  }, () => {
+    log(`serving on port ${port}`);
+  });
+})();
